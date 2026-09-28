@@ -1,0 +1,9 @@
+# secrets / local config (see .env.example)
+.env
+.env.local
+
+node_modules/
+api/dist/
+
+# local working copies
+api.src/
