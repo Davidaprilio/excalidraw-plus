@@ -1,0 +1,49 @@
+FROM --platform=${BUILDPLATFORM} node:24 AS build
+
+WORKDIR /opt/node_app
+
+COPY excalidraw/ .
+
+# Override .env.production at repo root (vite loads from envDir: "../")
+RUN cat > .env.production <<'EOF'
+MODE="production"
+
+VITE_APP_BACKEND_V2_GET_URL=/api/scenes/shared/
+VITE_APP_BACKEND_V2_POST_URL=/api/files
+
+VITE_APP_LIBRARY_URL=/api/libraries
+VITE_APP_LIBRARY_BACKEND=/api/libraries
+
+VITE_APP_PLUS_LP=
+VITE_APP_PLUS_APP=
+
+VITE_APP_AI_BACKEND=
+
+VITE_APP_WS_SERVER_URL=
+
+VITE_APP_FIREBASE_CONFIG=
+
+VITE_APP_ENABLE_TRACKING=false
+
+VITE_APP_DISABLE_SENTRY=true
+
+VITE_APP_DEBUG_ENABLE_TEXT_CONTAINER_BOUNDING_BOX=false
+VITE_APP_COLLAPSE_OVERLAY=false
+VITE_APP_ENABLE_ESLINT=false
+
+VITE_APP_SELF_HOSTED=true
+VITE_APP_API_URL=/api
+EOF
+
+RUN --mount=type=cache,target=/root/.cache/yarn \
+    npm_config_target_arch=${TARGETARCH} yarn --frozen-lockfile --network-timeout 600000
+
+ARG NODE_ENV=production
+
+RUN npm_config_target_arch=${TARGETARCH} yarn build:app:docker
+
+FROM nginx:stable-alpine-slim
+
+COPY --from=build /opt/node_app/excalidraw-app/build /usr/share/nginx/html
+
+HEALTHCHECK CMD wget -q -O /dev/null http://localhost || exit 1
