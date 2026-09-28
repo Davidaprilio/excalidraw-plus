@@ -71,6 +71,7 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
               s.owner_id, u.name as owner_name, ub.name as updated_by_name,
               s.collection_id, c.name as collection_name,
               s.deleted_at, db.name as deleted_by_name, v.visited_at,
+              (pin.scene_id IS NOT NULL) as pinned,
               t.scene_version as thumbnail_version,
               EXISTS (
                 SELECT 1 FROM jsonb_array_elements(s.elements) e
@@ -84,6 +85,7 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
        LEFT JOIN users db ON db.id = s.deleted_by
        LEFT JOIN scene_thumbnails t ON t.scene_id = s.id
        LEFT JOIN scene_visits v ON v.scene_id = s.id AND v.user_id = $1
+       LEFT JOIN scene_pins pin ON pin.scene_id = s.id AND pin.user_id = $1
        WHERE ${filters.join(" AND ")}
        ORDER BY ${orderBy}
        LIMIT ${limit}`,
@@ -160,6 +162,31 @@ router.get("/:id", authMiddleware, async (req: AuthRequest, res) => {
       [req.params.id]
     );
     res.json({ scene });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+// Pin / unpin the scene for the current user
+router.post("/:id/pin", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    if (!(await findScene(req.params.id as string, req.userId!))) {
+      return res.status(404).json({ error: "Scene not found" });
+    }
+    await query(
+      "INSERT INTO scene_pins (user_id, scene_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+      [req.userId, req.params.id]
+    );
+    res.json({ pinned: true });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+router.delete("/:id/pin", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    await query("DELETE FROM scene_pins WHERE user_id = $1 AND scene_id = $2", [req.userId, req.params.id]);
+    res.json({ pinned: false });
   } catch (err: any) {
     serverError(res, err);
   }
