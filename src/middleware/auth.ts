@@ -1,7 +1,13 @@
 import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 
-const JWT_SECRET = process.env.JWT_SECRET || "change-me-in-production";
+const JWT_SECRET = process.env.JWT_SECRET as string;
+if (!JWT_SECRET) {
+  throw new Error("JWT_SECRET is not set");
+}
+if (JWT_SECRET.startsWith("change-")) {
+  console.warn("WARNING: JWT_SECRET is still a placeholder value, set a random secret in production");
+}
 
 export interface AuthRequest extends Request {
   userId?: string;

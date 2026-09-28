@@ -1,9 +1,13 @@
 import { Router } from "express";
 import { query, queryOne } from "../db";
 import { authMiddleware, AuthRequest } from "../middleware/auth";
+import { requireUuidParam, serverError } from "../utils/http";
 import { v4 as uuidv4 } from "uuid";
 
 const router = Router();
+
+router.param("id", requireUuidParam);
+router.param("userId", requireUuidParam);
 
 // List user's teams
 router.get("/", authMiddleware, async (req: AuthRequest, res) => {
@@ -19,7 +23,7 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
     );
     res.json({ teams });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -44,7 +48,7 @@ router.post("/", authMiddleware, async (req: AuthRequest, res) => {
 
     res.status(201).json({ team });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -71,14 +75,18 @@ router.get("/:id", authMiddleware, async (req: AuthRequest, res) => {
 
     res.json({ team, members });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
 // Add member
 router.post("/:id/members", authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const { email, role } = req.body;
+    const { email } = req.body;
+    const role = req.body.role || "member";
+    if (!["member", "admin"].includes(role)) {
+      return res.status(400).json({ error: "Role must be member or admin" });
+    }
 
     // Check if requester is admin/owner
     const requester = await queryOne(
@@ -87,6 +95,9 @@ router.post("/:id/members", authMiddleware, async (req: AuthRequest, res) => {
     );
     if (!requester || !["owner", "admin"].includes(requester.role)) {
       return res.status(403).json({ error: "Only owners/admins can add members" });
+    }
+    if (role === "admin" && requester.role !== "owner") {
+      return res.status(403).json({ error: "Only the owner can add admins" });
     }
 
     const user = await queryOne("SELECT id FROM users WHERE email = $1", [email]);
@@ -98,24 +109,40 @@ router.post("/:id/members", authMiddleware, async (req: AuthRequest, res) => {
       `INSERT INTO team_members (team_id, user_id, role)
        VALUES ($1, $2, $3)
        ON CONFLICT (team_id, user_id) DO NOTHING`,
-      [req.params.id, user.id, role || "member"]
+      [req.params.id, user.id, role]
     );
 
     res.json({ ok: true });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
-// Remove member
+// Remove member (or leave the team when removing yourself)
 router.delete("/:id/members/:userId", authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const requester = await queryOne(
-      "SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2",
-      [req.params.id, req.userId]
+    const [requester, target] = await Promise.all(
+      [req.userId, req.params.userId].map((userId) =>
+        queryOne("SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2", [req.params.id, userId])
+      )
     );
-    if (!requester || !["owner", "admin"].includes(requester.role)) {
-      return res.status(403).json({ error: "Only owners/admins can remove members" });
+    if (!requester) {
+      return res.status(403).json({ error: "Not a team member" });
+    }
+    if (!target) {
+      return res.status(404).json({ error: "Member not found" });
+    }
+    if (target.role === "owner") {
+      return res.status(403).json({ error: "The team owner cannot be removed" });
+    }
+
+    const isSelf = req.params.userId === req.userId;
+    const canRemove =
+      isSelf ||
+      requester.role === "owner" ||
+      (requester.role === "admin" && target.role === "member");
+    if (!canRemove) {
+      return res.status(403).json({ error: "Not allowed to remove this member" });
     }
 
     await query(
@@ -125,7 +152,7 @@ router.delete("/:id/members/:userId", authMiddleware, async (req: AuthRequest, r
 
     res.json({ ok: true });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 

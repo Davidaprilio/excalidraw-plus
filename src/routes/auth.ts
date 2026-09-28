@@ -1,6 +1,7 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
-import { query, queryOne } from "../db";
+import { query, queryOne, withTransaction } from "../db";
+import { createWorkspace, defaultWorkspaceName } from "../access";
 import {
   signAccessToken,
   signRefreshToken,
@@ -8,6 +9,7 @@ import {
   authMiddleware,
   AuthRequest,
 } from "../middleware/auth";
+import { serverError } from "../utils/http";
 
 const router = Router();
 
@@ -24,10 +26,15 @@ router.post("/register", async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
-    const user = await queryOne(
-      "INSERT INTO users (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id, email, name, created_at",
-      [email, passwordHash, name || email.split("@")[0]]
-    );
+    // Every account starts with its own workspace (and Private collection)
+    const user = await withTransaction(async (client) => {
+      const { rows: [created] } = await client.query(
+        "INSERT INTO users (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id, email, name, created_at",
+        [email, passwordHash, name || email.split("@")[0]]
+      );
+      await createWorkspace(client, created.id, defaultWorkspaceName(created), { personal: true });
+      return created;
+    });
 
     const accessToken = signAccessToken(user!.id);
     const refreshToken = signRefreshToken(user!.id);
@@ -39,8 +46,7 @@ router.post("/register", async (req, res) => {
 
     res.status(201).json({ accessToken, refreshToken, user });
   } catch (err: any) {
-    console.error("Register error:", err, "stack:", err?.stack, "keys:", Object.keys(err || {}));
-    res.status(500).json({ error: err.message || err.code || String(err) });
+    serverError(res, err);
   }
 });
 
@@ -78,7 +84,7 @@ router.post("/login", async (req, res) => {
       user: { id: user.id, email: user.email, name: user.name },
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -105,7 +111,7 @@ router.post("/refresh", async (req, res) => {
     const accessToken = signAccessToken(payload.userId);
     res.json({ accessToken });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -117,7 +123,7 @@ router.post("/logout", authMiddleware, async (req: AuthRequest, res) => {
     }
     res.json({ ok: true });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -132,7 +138,7 @@ router.get("/me", authMiddleware, async (req: AuthRequest, res) => {
     }
     res.json({ user });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 

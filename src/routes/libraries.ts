@@ -1,9 +1,12 @@
 import { Router } from "express";
 import { query, queryOne } from "../db";
 import { authMiddleware, AuthRequest } from "../middleware/auth";
+import { requireUuidParam, serverError } from "../utils/http";
 import { v4 as uuidv4 } from "uuid";
 
 const router = Router();
+
+router.param("id", requireUuidParam);
 
 // List user's libraries
 router.get("/", authMiddleware, async (req: AuthRequest, res) => {
@@ -18,7 +21,7 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
     );
     res.json({ libraries });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -34,7 +37,7 @@ router.post("/", authMiddleware, async (req: AuthRequest, res) => {
     );
     res.status(201).json({ library });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -57,7 +60,7 @@ router.put("/:id", authMiddleware, async (req: AuthRequest, res) => {
     }
     res.json({ library });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -67,7 +70,7 @@ router.delete("/:id", authMiddleware, async (req: AuthRequest, res) => {
     await query("DELETE FROM libraries WHERE id = $1 AND owner_id = $2", [req.params.id, req.userId]);
     res.json({ ok: true });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
