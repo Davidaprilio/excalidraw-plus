@@ -11,6 +11,7 @@ import collabRoutes from "./routes/collab";
 import workspaceRoutes from "./routes/workspaces";
 import inviteRoutes from "./routes/invites";
 import avatarRoutes from "./routes/avatars";
+import commentRoutes from "./routes/comments";
 import securityRoutes from "./routes/security";
 
 const app = express();
@@ -27,6 +28,7 @@ app.get("/api/health", (_req, res) => {
 // Routes
 app.use("/api/auth", authRoutes);
 app.use("/api/auth", securityRoutes);
+app.use("/api/scenes/:sceneId/comments", commentRoutes);
 app.use("/api/scenes", sceneRoutes);
 app.use("/api/files", fileRoutes);
 app.use("/api/libraries", libraryRoutes);
