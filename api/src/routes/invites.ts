@@ -11,6 +11,7 @@ router.use(authMiddleware);
 const findInvite = (token: string) =>
   queryOne(
     `SELECT i.id, i.workspace_id, i.email, i.role, i.expires_at, w.name as workspace_name,
+            (extract(epoch from w.avatar_updated_at) * 1000)::bigint as workspace_avatar_version,
             u.name as invited_by_name
      FROM workspace_invites i
      JOIN workspaces w ON w.id = i.workspace_id AND w.deleted_at IS NULL
@@ -34,6 +35,7 @@ router.get("/:token", async (req: AuthRequest, res) => {
       invite: {
         workspaceId: invite.workspace_id,
         workspaceName: invite.workspace_name,
+        workspaceAvatarVersion: invite.workspace_avatar_version,
         invitedByName: invite.invited_by_name,
         role: invite.role,
         email: invite.email,

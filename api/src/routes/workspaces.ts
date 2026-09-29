@@ -4,6 +4,7 @@ import { query, queryOne, withTransaction } from "../db";
 import { authMiddleware, AuthRequest } from "../middleware/auth";
 import { requireUuidParam, serverError } from "../utils/http";
 import { createWorkspace, defaultWorkspaceName, getMembership, Membership, WorkspaceRole } from "../access";
+import { avatarVersionSql, parseAvatarDataUrl } from "../utils/avatar";
 
 const router = Router();
 
@@ -43,7 +44,8 @@ const requireRole = async (req: AuthRequest, res: Response, needed: "any" | "adm
 const WORKSPACE_COLUMNS = `w.id, w.name, w.created_at, w.is_personal, w.owner_id, u.name as owner_name,
   (w.owner_id = $1) as is_owner,
   (SELECT COUNT(*)::int FROM workspace_members m WHERE m.workspace_id = w.id) as member_count,
-  (SELECT COUNT(*)::int FROM scenes s WHERE s.workspace_id = w.id AND s.deleted_at IS NULL) as scene_count`;
+  (SELECT COUNT(*)::int FROM scenes s WHERE s.workspace_id = w.id AND s.deleted_at IS NULL) as scene_count,
+  ${avatarVersionSql("w")}`;
 
 /** Soft delete: members lose access at once; the owner can restore it from their trash. */
 const softDeleteWorkspace = (workspaceId: string, userId: string) =>
@@ -179,6 +181,39 @@ router.patch("/:wid", async (req: AuthRequest, res) => {
       [name.slice(0, 255), req.params.wid]
     );
     res.json({ workspace });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+// Workspace photo (admins); served publicly by routes/avatars.ts
+router.put("/:wid/avatar", async (req: AuthRequest, res) => {
+  try {
+    if (!(await requireRole(req, res, "admin"))) return;
+    const avatar = parseAvatarDataUrl(req.body.image);
+    if ("error" in avatar) {
+      return res.status(avatar.status).json({ error: avatar.error });
+    }
+    const workspace = await queryOne(
+      `UPDATE workspaces SET avatar = $1, avatar_mime = $2, avatar_updated_at = NOW(), updated_at = NOW()
+       WHERE id = $3
+       RETURNING id, ${avatarVersionSql()}`,
+      [avatar.data, avatar.mime, req.params.wid]
+    );
+    res.json({ workspace });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+router.delete("/:wid/avatar", async (req: AuthRequest, res) => {
+  try {
+    if (!(await requireRole(req, res, "admin"))) return;
+    await query(
+      "UPDATE workspaces SET avatar = NULL, avatar_mime = NULL, avatar_updated_at = NULL, updated_at = NOW() WHERE id = $1",
+      [req.params.wid]
+    );
+    res.json({ workspace: { id: req.params.wid, avatar_version: null } });
   } catch (err: any) {
     serverError(res, err);
   }

@@ -10,7 +10,7 @@ import teamRoutes from "./routes/teams";
 import collabRoutes from "./routes/collab";
 import workspaceRoutes from "./routes/workspaces";
 import inviteRoutes from "./routes/invites";
-import userRoutes from "./routes/users";
+import avatarRoutes from "./routes/avatars";
 import securityRoutes from "./routes/security";
 
 const app = express();
@@ -32,9 +32,10 @@ app.use("/api/files", fileRoutes);
 app.use("/api/libraries", libraryRoutes);
 app.use("/api/teams", teamRoutes);
 app.use("/api/collab", collabRoutes);
+// public avatars first: the workspaces router requires auth for everything
+app.use("/api", avatarRoutes);
 app.use("/api/workspaces", workspaceRoutes);
 app.use("/api/invites", inviteRoutes);
-app.use("/api/users", userRoutes);
 
 runMigrations()
   .then(() => {

@@ -11,6 +11,7 @@ import {
 } from "../middleware/auth";
 import { serverError } from "../utils/http";
 import { issueSession } from "../utils/session";
+import { parseAvatarDataUrl } from "../utils/avatar";
 import crypto from "crypto";
 
 const router = Router();
@@ -149,25 +150,18 @@ router.patch("/me", authMiddleware, async (req: AuthRequest, res) => {
   }
 });
 
-const AVATAR_DATA_URL_RE = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/;
-const MAX_AVATAR_BYTES = 256 * 1024;
-
 // Upload profile photo (a data URL, already resized by the client)
 router.put("/me/avatar", authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const match = typeof req.body.image === "string" && AVATAR_DATA_URL_RE.exec(req.body.image);
-    if (!match) {
-      return res.status(400).json({ error: "image must be a png/jpeg/webp data URL" });
-    }
-    const data = Buffer.from(match[2], "base64");
-    if (data.length > MAX_AVATAR_BYTES) {
-      return res.status(413).json({ error: "Photo too large" });
+    const avatar = parseAvatarDataUrl(req.body.image);
+    if ("error" in avatar) {
+      return res.status(avatar.status).json({ error: avatar.error });
     }
     const user = await queryOne(
       `UPDATE users SET avatar = $1, avatar_mime = $2, avatar_updated_at = NOW(), updated_at = NOW()
        WHERE id = $3
        RETURNING id, email, name, created_at, ${"(extract(epoch from avatar_updated_at) * 1000)::bigint as avatar_version"}`,
-      [data, match[1], req.userId]
+      [avatar.data, avatar.mime, req.userId]
     );
     res.json({ user });
   } catch (err: any) {
