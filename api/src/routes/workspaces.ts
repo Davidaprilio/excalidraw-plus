@@ -492,7 +492,7 @@ router.get("/:wid/collections", async (req: AuthRequest, res) => {
   try {
     if (!(await requireRole(req, res, "any"))) return;
     const collections = await query(
-      `SELECT c.id, c.name, c.visibility, c.is_personal, c.owner_id, u.name as owner_name, c.created_at,
+      `SELECT c.id, c.name, c.visibility, c.is_personal, c.owner_id, u.name as owner_name, c.created_at, c.share_token, c.share_allow_save,
               (SELECT COUNT(*)::int FROM scenes s
                WHERE s.collection_id = c.id AND s.deleted_at IS NULL
                  AND (s.owner_id = $2 OR c.visibility = 'workspace')) as scene_count
@@ -518,7 +518,7 @@ router.post("/:wid/collections", async (req: AuthRequest, res) => {
     const collection = await queryOne(
       `INSERT INTO collections (workspace_id, owner_id, name, visibility)
        VALUES ($1, $2, $3, $4)
-       RETURNING id, name, visibility, is_personal, owner_id, created_at`,
+       RETURNING id, name, visibility, is_personal, owner_id, created_at, share_token, share_allow_save`,
       [req.params.wid, req.userId, name.slice(0, 255), visibility]
     );
     res.status(201).json({ collection: { ...collection, scene_count: 0 } });
@@ -562,9 +562,62 @@ router.patch("/:wid/collections/:cid", async (req: AuthRequest, res) => {
     const collection = await queryOne(
       `UPDATE collections SET name = COALESCE($1, name), visibility = COALESCE($2, visibility), updated_at = NOW()
        WHERE id = $3
-       RETURNING id, name, visibility, is_personal, owner_id`,
+       RETURNING id, name, visibility, is_personal, owner_id, share_token, share_allow_save`,
       [name?.slice(0, 255) ?? null, visibility ?? null, req.params.cid]
     );
+    res.json({ collection });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+// Read-only link to every scene in the collection. Reuses the token while shared;
+// stopping drops it, so sharing again gives a new link.
+router.post("/:wid/collections/:cid/share", async (req: AuthRequest, res) => {
+  try {
+    if (!(await findManageableCollection(req, res))) return;
+    const collection = await queryOne(
+      `UPDATE collections SET share_token = COALESCE(share_token, $1), updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, share_token, share_allow_save`,
+      [crypto.randomBytes(24).toString("hex"), req.params.cid]
+    );
+    res.json({ collection });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+router.delete("/:wid/collections/:cid/share", async (req: AuthRequest, res) => {
+  try {
+    if (!(await findManageableCollection(req, res))) return;
+    const collection = await queryOne(
+      `UPDATE collections SET share_token = NULL, share_allow_save = FALSE, updated_at = NOW()
+       WHERE id = $1 RETURNING id, share_token, share_allow_save`,
+      [req.params.cid]
+    );
+    res.json({ collection });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+// Share link options: { allowSave } lets viewers "Save to..." copies (off by default)
+router.patch("/:wid/collections/:cid/share", async (req: AuthRequest, res) => {
+  try {
+    if (!(await findManageableCollection(req, res))) return;
+    if (typeof req.body.allowSave !== "boolean") {
+      return res.status(400).json({ error: "allowSave must be a boolean" });
+    }
+    const collection = await queryOne(
+      `UPDATE collections SET share_allow_save = $1, updated_at = NOW()
+       WHERE id = $2 AND share_token IS NOT NULL
+       RETURNING id, share_token, share_allow_save`,
+      [req.body.allowSave, req.params.cid]
+    );
+    if (!collection) {
+      return res.status(409).json({ error: "The collection isn't shared by link" });
+    }
     res.json({ collection });
   } catch (err: any) {
     serverError(res, err);

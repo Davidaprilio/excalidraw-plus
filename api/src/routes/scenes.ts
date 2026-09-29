@@ -179,7 +179,7 @@ router.get("/:id/access", authMiddleware, async (req: AuthRequest, res) => {
       return res.status(404).json({ error: "Scene not found" });
     }
     const info = await queryOne<any>(
-      `SELECT s.is_shared, s.share_token, w.id as workspace_id, w.name as workspace_name,
+      `SELECT s.is_shared, s.share_token, s.share_allow_save, w.id as workspace_id, w.name as workspace_name,
               c.id as collection_id, c.name as collection_name, c.visibility as collection_visibility
        FROM scenes s
        JOIN workspaces w ON w.id = s.workspace_id
@@ -209,6 +209,7 @@ router.get("/:id/access", authMiddleware, async (req: AuthRequest, res) => {
           : null,
         is_shared: info.is_shared,
         share_token: info.is_shared ? info.share_token : null,
+        share_allow_save: info.share_allow_save,
         users,
       },
     });
@@ -640,7 +641,7 @@ router.post("/:id/share", authMiddleware, async (req: AuthRequest, res) => {
     const scene = await queryOne(
       `UPDATE scenes SET is_shared = TRUE, share_token = COALESCE(share_token, $1)
        WHERE id = $2
-       RETURNING id, share_token, is_shared`,
+       RETURNING id, share_token, is_shared, share_allow_save`,
       [uuidv4().replace(/-/g, ""), req.params.id]
     );
     res.json({ scene });
@@ -656,11 +657,34 @@ router.delete("/:id/share", authMiddleware, async (req: AuthRequest, res) => {
       return res.status(404).json({ error: "Scene not found" });
     }
     const scene = await queryOne(
-      `UPDATE scenes SET is_shared = FALSE, share_token = NULL
+      `UPDATE scenes SET is_shared = FALSE, share_token = NULL, share_allow_save = FALSE
        WHERE id = $1
-       RETURNING id, share_token, is_shared`,
+       RETURNING id, share_token, is_shared, share_allow_save`,
       [req.params.id]
     );
+    res.json({ scene });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+// Share link options: { allowSave } lets viewers "Save to..." a copy (off by default)
+router.patch("/:id/share", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    if (!(await findScene(req.params.id as string, req.userId!))) {
+      return res.status(404).json({ error: "Scene not found" });
+    }
+    if (typeof req.body.allowSave !== "boolean") {
+      return res.status(400).json({ error: "allowSave must be a boolean" });
+    }
+    const scene = await queryOne(
+      `UPDATE scenes SET share_allow_save = $1 WHERE id = $2 AND is_shared
+       RETURNING id, share_token, is_shared, share_allow_save`,
+      [req.body.allowSave, req.params.id]
+    );
+    if (!scene) {
+      return res.status(409).json({ error: "The scene isn't shared by link" });
+    }
     res.json({ scene });
   } catch (err: any) {
     serverError(res, err);
@@ -671,7 +695,7 @@ router.delete("/:id/share", authMiddleware, async (req: AuthRequest, res) => {
 router.get("/shared/:token", async (req, res) => {
   try {
     const scene = await queryOne(
-      `SELECT id, title, elements, app_state, version, created_at, updated_at
+      `SELECT id, title, elements, app_state, version, created_at, updated_at, share_allow_save as allow_save
        FROM scenes s
        WHERE s.share_token = $1 AND s.is_shared = TRUE AND s.deleted_at IS NULL
          AND EXISTS (SELECT 1 FROM workspaces w WHERE w.id = s.workspace_id AND w.deleted_at IS NULL)`,

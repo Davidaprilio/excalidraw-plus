@@ -13,6 +13,7 @@ import inviteRoutes from "./routes/invites";
 import avatarRoutes from "./routes/avatars";
 import commentRoutes from "./routes/comments";
 import securityRoutes from "./routes/security";
+import sharedCollectionRoutes from "./routes/sharedCollections";
 
 const app = express();
 const PORT = parseInt(process.env.PORT || "4001");
@@ -35,6 +36,8 @@ app.use("/api/libraries", libraryRoutes);
 app.use("/api/teams", teamRoutes);
 app.use("/api/collab", collabRoutes);
 // public avatars first: the workspaces router requires auth for everything
+// public (no login): collections shared by link
+app.use("/api/shared/collections", sharedCollectionRoutes);
 app.use("/api", avatarRoutes);
 app.use("/api/workspaces", workspaceRoutes);
 app.use("/api/invites", inviteRoutes);
