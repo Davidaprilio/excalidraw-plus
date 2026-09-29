@@ -179,7 +179,7 @@ router.get("/:id/access", authMiddleware, async (req: AuthRequest, res) => {
       return res.status(404).json({ error: "Scene not found" });
     }
     const info = await queryOne<any>(
-      `SELECT s.is_shared, w.id as workspace_id, w.name as workspace_name,
+      `SELECT s.is_shared, s.share_token, w.id as workspace_id, w.name as workspace_name,
               c.id as collection_id, c.name as collection_name, c.visibility as collection_visibility
        FROM scenes s
        JOIN workspaces w ON w.id = s.workspace_id
@@ -208,6 +208,7 @@ router.get("/:id/access", authMiddleware, async (req: AuthRequest, res) => {
           ? { id: info.collection_id, name: info.collection_name, visibility: info.collection_visibility }
           : null,
         is_shared: info.is_shared,
+        share_token: info.is_shared ? info.share_token : null,
         users,
       },
     });
