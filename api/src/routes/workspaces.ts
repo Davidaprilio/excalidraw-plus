@@ -414,6 +414,37 @@ router.get("/:wid/invites", async (req: AuthRequest, res) => {
 });
 
 // Invite by email (single use, only that email can accept) or, without email, a shareable link
+// Suggest registered users while typing an invite (INVITE_USER_SUGGESTIONS=false turns it off)
+const INVITE_SUGGESTIONS_ENABLED = process.env.INVITE_USER_SUGGESTIONS !== "false";
+const SUGGESTION_LIMIT = 8;
+
+router.get("/:wid/invite-suggestions", async (req: AuthRequest, res) => {
+  try {
+    if (!(await requireRole(req, res, "admin"))) return;
+    if (!INVITE_SUGGESTIONS_ENABLED) {
+      return res.json({ enabled: false, users: [] });
+    }
+    const q = typeof req.query.q === "string" ? req.query.q.trim().toLowerCase().slice(0, 100) : "";
+    // a couple of characters at least, so the list can't be dumped in one go
+    if (q.length < 2) {
+      return res.json({ enabled: true, users: [] });
+    }
+    const like = `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+    const users = await query(
+      `SELECT u.id, u.name, u.email, (extract(epoch from u.avatar_updated_at) * 1000)::bigint as avatar_version
+       FROM users u
+       WHERE (LOWER(u.email) LIKE $2 OR LOWER(COALESCE(u.name, '')) LIKE $2)
+         AND NOT EXISTS (SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = $1 AND wm.user_id = u.id)
+       ORDER BY (LOWER(u.email) LIKE $3 OR LOWER(COALESCE(u.name, '')) LIKE $3) DESC, LOWER(COALESCE(u.name, u.email))
+       LIMIT ${SUGGESTION_LIMIT}`,
+      [req.params.wid, like, `${like.slice(1)}`]
+    );
+    res.json({ enabled: true, users });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
 router.post("/:wid/invites", async (req: AuthRequest, res) => {
   try {
     if (!(await requireRole(req, res, "admin"))) return;

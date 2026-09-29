@@ -11,6 +11,8 @@ services:
       UPLOAD_DIR: /uploads
       # public URL of the app (passkeys only work on this origin)
       APP_ORIGIN: ${APP_ORIGIN_DOCKER:-http://localhost}
+      # "false": no registered-user suggestions in "Invite people"
+      INVITE_USER_SUGGESTIONS: ${INVITE_USER_SUGGESTIONS:-true}
       PORT: 4001
     volumes:
       - uploads:/uploads
