@@ -4,6 +4,9 @@ import { query, queryOne, withTransaction } from "../db";
 import { authMiddleware, AuthRequest } from "../middleware/auth";
 import { isUuid, requireUuidParam, serverError } from "../utils/http";
 import {
+  ACCESS,
+  AccessibleScene,
+  canEditScene,
   ensurePersonalCollection,
   findCollection,
   findScene,
@@ -29,6 +32,16 @@ function parseVersion(value: string): number | null {
   const version = Number(value);
   return Number.isInteger(version) && version > 0 ? version : null;
 }
+
+const READ_ONLY = { error: "You can only view this scene" };
+
+/** Scenes in a private collection (not someone's own Private one) can't be shared by link */
+const inPrivateCollection = async (scene: AccessibleScene) =>
+  !!scene.collection_id &&
+  !!(await queryOne(
+    "SELECT 1 FROM collections WHERE id = $1 AND visibility = 'private' AND NOT is_personal",
+    [scene.collection_id]
+  ));
 
 const escapeLike = (value: string) => value.replace(/[\\%_]/g, (c) => `\\${c}`);
 
@@ -67,7 +80,7 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
     }[view];
 
     const scenes = await query(
-      `SELECT s.id, s.title, s.version, s.is_shared, s.created_at, s.updated_at,
+      `SELECT s.id, s.title, s.version, s.is_shared, s.share_token, s.created_at, s.updated_at,
               s.owner_id, u.name as owner_name, ub.name as updated_by_name,
               s.collection_id, c.name as collection_name,
               s.deleted_at, db.name as deleted_by_name, v.visited_at,
@@ -77,7 +90,9 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
                 SELECT 1 FROM jsonb_array_elements(s.elements) e
                 WHERE NOT COALESCE((e->>'isDeleted')::boolean, false)
               ) as has_content,
-              (s.owner_id = $1 OR wm.role = 'admin') as can_delete_permanently
+              (s.owner_id = $1 OR wm.role = 'admin') as can_delete_permanently,
+              ${access.level} as access_level,
+              COALESCE(c.visibility = 'private' AND NOT c.is_personal, FALSE) as share_blocked
        FROM scenes s
        ${access.joins}
        LEFT JOIN users u ON u.id = s.owner_id
@@ -150,7 +165,8 @@ router.post("/", authMiddleware, async (req: AuthRequest, res) => {
 // Get scene
 router.get("/:id", authMiddleware, async (req: AuthRequest, res) => {
   try {
-    if (!(await findScene(req.params.id as string, req.userId!))) {
+    const found = await findScene(req.params.id as string, req.userId!);
+    if (!found) {
       return res.status(404).json({ error: "Scene not found" });
     }
     const scene = await queryOne(
@@ -161,16 +177,16 @@ router.get("/:id", authMiddleware, async (req: AuthRequest, res) => {
        WHERE s.id = $1`,
       [req.params.id]
     );
-    res.json({ scene });
+    res.json({ scene: { ...scene, access_level: found.access_level } });
   } catch (err: any) {
     serverError(res, err);
   }
 });
 
 /**
- * Who can open the scene: its owner, plus every workspace member when it sits in
- * a collection shared with the workspace (see sceneAccessSql). Read only: access
- * is managed from the dashboard (members, collections, share link).
+ * Who can open the scene and at which level: its owner, plus the people its
+ * collection gives access to (see collection_access_level). Read only: access
+ * is managed from the dashboard (collection settings, members, share link).
  */
 router.get("/:id/access", authMiddleware, async (req: AuthRequest, res) => {
   try {
@@ -180,7 +196,8 @@ router.get("/:id/access", authMiddleware, async (req: AuthRequest, res) => {
     }
     const info = await queryOne<any>(
       `SELECT s.is_shared, s.share_token, s.share_allow_save, w.id as workspace_id, w.name as workspace_name,
-              c.id as collection_id, c.name as collection_name, c.visibility as collection_visibility
+              c.id as collection_id, c.name as collection_name, c.visibility as collection_visibility,
+              c.is_personal as collection_is_personal
        FROM scenes s
        JOIN workspaces w ON w.id = s.workspace_id
        LEFT JOIN collections c ON c.id = s.collection_id
@@ -190,29 +207,152 @@ router.get("/:id/access", authMiddleware, async (req: AuthRequest, res) => {
     const users = await query(
       `SELECT u.id, u.name, u.email,
               (extract(epoch from u.avatar_updated_at) * 1000)::bigint as avatar_version,
-              CASE WHEN u.id = s.owner_id THEN 'owner'
-                   WHEN wm.role = 'admin' THEN 'admin'
-                   ELSE 'editor' END as access
+              CASE WHEN l.level >= 3 AND u.id = s.owner_id THEN 'owner'
+                   WHEN l.level >= 3 THEN 'manage'
+                   WHEN l.level = 2 THEN 'edit'
+                   ELSE 'view' END as access,
+              sm.role as direct_role,
+              NOT EXISTS (SELECT 1 FROM workspace_members m
+                          WHERE m.workspace_id = s.workspace_id AND m.user_id = u.id) as guest
        FROM scenes s
-       JOIN workspace_members wm ON wm.workspace_id = s.workspace_id
-       JOIN users u ON u.id = wm.user_id
-       LEFT JOIN collections c ON c.id = s.collection_id
-       WHERE s.id = $1 AND (wm.user_id = s.owner_id OR c.visibility = 'workspace')
-       ORDER BY (u.id = s.owner_id) DESC, (wm.role = 'admin') DESC, lower(coalesce(u.name, u.email))`,
+       -- everyone who could have access: its workspace, people added to the scene or
+       -- its collection, and members of the teams the collection is shared with
+       CROSS JOIN LATERAL (
+         SELECT wm.user_id FROM workspace_members wm WHERE wm.workspace_id = s.workspace_id
+         UNION SELECT x.user_id FROM scene_members x WHERE x.scene_id = s.id
+         UNION SELECT cm.user_id FROM collection_members cm WHERE cm.collection_id = s.collection_id
+         UNION SELECT tm.user_id FROM collection_teams ct
+               JOIN workspace_members tm ON tm.workspace_id = ct.workspace_id
+               WHERE ct.collection_id = s.collection_id
+       ) candidate
+       JOIN users u ON u.id = candidate.user_id
+       LEFT JOIN scene_members sm ON sm.scene_id = s.id AND sm.user_id = u.id
+       CROSS JOIN LATERAL (SELECT scene_access_level(s.id, u.id) as level) l
+       WHERE s.id = $1 AND l.level > 0
+       ORDER BY (u.id = s.owner_id) DESC, guest, l.level DESC, lower(coalesce(u.name, u.email))`,
       [scene.id]
     );
     res.json({
       access: {
         workspace: { id: info.workspace_id, name: info.workspace_name },
         collection: info.collection_id
-          ? { id: info.collection_id, name: info.collection_name, visibility: info.collection_visibility }
+          ? {
+              id: info.collection_id,
+              name: info.collection_name,
+              visibility: info.collection_visibility,
+              is_personal: info.collection_is_personal,
+            }
           : null,
         is_shared: info.is_shared,
         share_token: info.is_shared ? info.share_token : null,
         share_allow_save: info.share_allow_save,
+        my_level: scene.access_level,
+        // people from other workspaces may be invited (not in a private collection)
+        guests_allowed: !inPrivate(info),
         users,
       },
     });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+const inPrivate = (info: { collection_visibility: string | null; collection_is_personal: boolean | null }) =>
+  info.collection_visibility === "private" && !info.collection_is_personal;
+
+/** The scene if the user can manage it (invite people), else answers 404/403 */
+async function findManageableScene(req: AuthRequest, res: any) {
+  const scene = await findScene(req.params.id as string, req.userId!);
+  if (!scene) {
+    res.status(404).json({ error: "Scene not found" });
+    return null;
+  }
+  if (scene.access_level < ACCESS.manage) {
+    res.status(403).json({ error: "Only people who can manage this scene can do this" });
+    return null;
+  }
+  const info = await queryOne<any>(
+    `SELECT c.visibility as collection_visibility, c.is_personal as collection_is_personal
+     FROM scenes s LEFT JOIN collections c ON c.id = s.collection_id WHERE s.id = $1`,
+    [scene.id]
+  );
+  return { ...scene, guestsAllowed: !inPrivate(info) };
+}
+
+const INVITE_SUGGESTIONS_ENABLED = process.env.INVITE_USER_SUGGESTIONS !== "false";
+
+// People to invite to the scene, by name or email (2+ characters): its workspace, and
+// anyone registered when it may leave the workspace (exact email only when suggestions are off)
+router.get("/:id/people", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const scene = await findManageableScene(req, res);
+    if (!scene) return;
+    const q = typeof req.query.q === "string" ? req.query.q.trim().toLowerCase().slice(0, 100) : "";
+    if (q.length < 2) {
+      return res.json({ users: [] });
+    }
+    const like = `%${escapeLike(q)}%`;
+    const users = await query(
+      `SELECT u.id, u.name, u.email, (extract(epoch from u.avatar_updated_at) * 1000)::bigint as avatar_version,
+              (wm.user_id IS NULL) as guest
+       FROM users u
+       LEFT JOIN workspace_members wm ON wm.workspace_id = $1 AND wm.user_id = u.id
+       WHERE u.id <> $3 AND u.id <> $4
+         AND NOT EXISTS (SELECT 1 FROM scene_members sm WHERE sm.scene_id = $2 AND sm.user_id = u.id)
+         AND (
+           (wm.user_id IS NOT NULL AND (LOWER(u.email) LIKE $5 OR LOWER(COALESCE(u.name, '')) LIKE $5))
+           OR ($6 AND $7 AND (LOWER(u.email) LIKE $5 OR LOWER(COALESCE(u.name, '')) LIKE $5))
+           OR ($6 AND LOWER(u.email) = $8)
+         )
+       ORDER BY (wm.user_id IS NULL), LOWER(COALESCE(u.name, u.email))
+       LIMIT 8`,
+      [scene.workspace_id, scene.id, req.userId, scene.owner_id, like, scene.guestsAllowed, INVITE_SUGGESTIONS_ENABLED, q]
+    );
+    res.json({ users });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+// Invite someone to the scene, or change their role: { role }
+router.put("/:id/members/:uid", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const scene = await findManageableScene(req, res);
+    if (!scene) return;
+    const { role } = req.body;
+    if (!["view", "edit", "manage"].includes(role)) {
+      return res.status(400).json({ error: "Role must be view, edit or manage" });
+    }
+    if (!isUuid(req.params.uid) || !(await queryOne("SELECT 1 FROM users WHERE id = $1", [req.params.uid]))) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    if (req.params.uid === scene.owner_id) {
+      return res.status(400).json({ error: "The owner always has full access" });
+    }
+    const inWorkspace = await queryOne("SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2", [
+      scene.workspace_id,
+      req.params.uid,
+    ]);
+    if (!inWorkspace && !scene.guestsAllowed) {
+      return res.status(400).json({ error: "Scenes in a private collection can only be shared within their workspace" });
+    }
+    await query(
+      `INSERT INTO scene_members (scene_id, user_id, role, added_by) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (scene_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+      [scene.id, req.params.uid, role, req.userId]
+    );
+    res.json({ ok: true });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+// Remove someone's invite (managers), or leave the scene yourself
+router.delete("/:id/members/:uid", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    if (req.params.uid !== req.userId && !(await findManageableScene(req, res))) return;
+    await query("DELETE FROM scene_members WHERE scene_id = $1 AND user_id = $2", [req.params.id, req.params.uid]);
+    res.json({ ok: true });
   } catch (err: any) {
     serverError(res, err);
   }
@@ -273,6 +413,9 @@ router.put("/:id", authMiddleware, async (req: AuthRequest, res) => {
       if (!current) {
         return null;
       }
+      if (!canEditScene(current)) {
+        return "readonly" as const;
+      }
 
       // Snapshot the state being overwritten, unless a recent snapshot exists
       await client.query(
@@ -298,6 +441,9 @@ router.put("/:id", authMiddleware, async (req: AuthRequest, res) => {
       return updated;
     });
 
+    if (scene === "readonly") {
+      return res.status(403).json(READ_ONLY);
+    }
     if (!scene) {
       return res.status(404).json({ error: "Scene not found" });
     }
@@ -321,6 +467,9 @@ router.patch("/:id", authMiddleware, async (req: AuthRequest, res) => {
     const current = await findScene(req.params.id as string, req.userId!);
     if (!current) {
       return res.status(404).json({ error: "Scene not found" });
+    }
+    if (!canEditScene(current)) {
+      return res.status(403).json(READ_ONLY);
     }
     if (collectionId !== undefined) {
       const collection = isUuid(collectionId) ? await findCollection(collectionId, req.userId!) : null;
@@ -483,8 +632,12 @@ router.put("/:id/thumbnail", authMiddleware, async (req: AuthRequest, res) => {
 // Move scene to the trash
 router.delete("/:id", authMiddleware, async (req: AuthRequest, res) => {
   try {
-    if (!(await findScene(req.params.id as string, req.userId!))) {
+    const scene = await findScene(req.params.id as string, req.userId!);
+    if (!scene) {
       return res.status(404).json({ error: "Scene not found" });
+    }
+    if (!canEditScene(scene)) {
+      return res.status(403).json(READ_ONLY);
     }
     await query(
       "UPDATE scenes SET deleted_at = NOW(), deleted_by = $2 WHERE id = $1",
@@ -502,6 +655,9 @@ router.post("/:id/untrash", authMiddleware, async (req: AuthRequest, res) => {
     const scene = await findScene(req.params.id as string, req.userId!, { includeDeleted: true });
     if (!scene?.deleted_at) {
       return res.status(404).json({ error: "Scene not found in trash" });
+    }
+    if (!canEditScene(scene)) {
+      return res.status(403).json(READ_ONLY);
     }
     await withTransaction(async (client) => {
       const collectionId =
@@ -591,6 +747,9 @@ router.post("/:id/restore/:version", authMiddleware, async (req: AuthRequest, re
       if (!current) {
         return null;
       }
+      if (!canEditScene(current)) {
+        return "readonly" as const;
+      }
 
       const { rows: [target] } = await client.query(
         `SELECT id FROM scene_versions
@@ -623,6 +782,9 @@ router.post("/:id/restore/:version", authMiddleware, async (req: AuthRequest, re
       return updated;
     });
 
+    if (scene === "readonly") {
+      return res.status(403).json(READ_ONLY);
+    }
     if (!scene) {
       return res.status(404).json({ error: "Scene or version not found" });
     }
@@ -635,8 +797,15 @@ router.post("/:id/restore/:version", authMiddleware, async (req: AuthRequest, re
 // Enable read-only link sharing. Reuses the existing token so links already sent keep working.
 router.post("/:id/share", authMiddleware, async (req: AuthRequest, res) => {
   try {
-    if (!(await findScene(req.params.id as string, req.userId!))) {
+    const found = await findScene(req.params.id as string, req.userId!);
+    if (!found) {
       return res.status(404).json({ error: "Scene not found" });
+    }
+    if (!canEditScene(found)) {
+      return res.status(403).json(READ_ONLY);
+    }
+    if (await inPrivateCollection(found)) {
+      return res.status(409).json({ error: "Scenes in a private collection can't be shared by link" });
     }
     const scene = await queryOne(
       `UPDATE scenes SET is_shared = TRUE, share_token = COALESCE(share_token, $1)
@@ -653,8 +822,12 @@ router.post("/:id/share", authMiddleware, async (req: AuthRequest, res) => {
 // Revoke link sharing. The old token is dropped, so re-sharing creates a new link.
 router.delete("/:id/share", authMiddleware, async (req: AuthRequest, res) => {
   try {
-    if (!(await findScene(req.params.id as string, req.userId!))) {
+    const found = await findScene(req.params.id as string, req.userId!);
+    if (!found) {
       return res.status(404).json({ error: "Scene not found" });
+    }
+    if (!canEditScene(found)) {
+      return res.status(403).json(READ_ONLY);
     }
     const scene = await queryOne(
       `UPDATE scenes SET is_shared = FALSE, share_token = NULL, share_allow_save = FALSE
@@ -671,8 +844,12 @@ router.delete("/:id/share", authMiddleware, async (req: AuthRequest, res) => {
 // Share link options: { allowSave } lets viewers "Save to..." a copy (off by default)
 router.patch("/:id/share", authMiddleware, async (req: AuthRequest, res) => {
   try {
-    if (!(await findScene(req.params.id as string, req.userId!))) {
+    const found = await findScene(req.params.id as string, req.userId!);
+    if (!found) {
       return res.status(404).json({ error: "Scene not found" });
+    }
+    if (!canEditScene(found)) {
+      return res.status(403).json(READ_ONLY);
     }
     if (typeof req.body.allowSave !== "boolean") {
       return res.status(400).json({ error: "allowSave must be a boolean" });

@@ -5,7 +5,7 @@ import fs from "fs";
 import { query, queryOne } from "../db";
 import { authMiddleware, AuthRequest } from "../middleware/auth";
 import { isUuid, serverError } from "../utils/http";
-import { findScene } from "../access";
+import { canEditScene, findScene } from "../access";
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || "/uploads";
 
@@ -42,6 +42,10 @@ router.post("/", authMiddleware, upload.single("file"), async (req: AuthRequest,
       if (!scene) {
         fs.unlinkSync(req.file.path);
         return res.status(404).json({ error: "Scene not found" });
+      }
+      if (!canEditScene(scene)) {
+        fs.unlinkSync(req.file.path);
+        return res.status(403).json({ error: "You can only view this scene" });
       }
     }
 

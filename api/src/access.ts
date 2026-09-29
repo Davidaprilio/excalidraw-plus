@@ -8,16 +8,28 @@ const run = async <T>(client: Db | null, text: string, params: any[]): Promise<T
 
 export type WorkspaceRole = "admin" | "member";
 
+/** Access levels (see collection_access_level in migration 015) */
+export const ACCESS = { none: 0, view: 1, edit: 2, manage: 3 } as const;
+export type CollectionRole = "view" | "edit" | "manage";
+export const COLLECTION_ROLES: CollectionRole[] = ["view", "edit", "manage"];
+export const levelToRole = (level: number): CollectionRole | null =>
+  level >= 3 ? "manage" : level === 2 ? "edit" : level === 1 ? "view" : null;
+
+/** SQL: the user's access level on scene `s` (see scene_access_level in migration 017) */
+export const sceneLevelSql = (userParam: string) => `scene_access_level(s.id, ${userParam})`;
+
 /**
- * SQL for "scenes `s` the user in `$userParam` may open": they must belong to the
- * scene's (not deleted) workspace, and either own the scene or it sits in a
- * collection shared with the whole workspace. Exposes `wm.role` and `c` (the collection).
+ * SQL for "scenes `s` the user in `$userParam` may open" in a live workspace: their
+ * own scenes (while they belong to its workspace) or scenes of a collection they
+ * can access, which may be shared with them from another workspace. Exposes
+ * `wm.role` (null for guests), `c` (the collection) and the level through `level`.
  */
 export const sceneAccessSql = (userParam: string) => ({
   joins: `JOIN workspaces sw ON sw.id = s.workspace_id AND sw.deleted_at IS NULL
-          JOIN workspace_members wm ON wm.workspace_id = s.workspace_id AND wm.user_id = ${userParam}
+          LEFT JOIN workspace_members wm ON wm.workspace_id = s.workspace_id AND wm.user_id = ${userParam}
           LEFT JOIN collections c ON c.id = s.collection_id`,
-  where: `(s.owner_id = ${userParam} OR c.visibility = 'workspace')`,
+  where: `(${sceneLevelSql(userParam)} > 0)`,
+  level: sceneLevelSql(userParam),
 });
 
 export type AccessibleScene = {
@@ -27,8 +39,14 @@ export type AccessibleScene = {
   collection_id: string | null;
   version: number;
   deleted_at: string | null;
-  role: WorkspaceRole;
+  /** role in the scene's workspace; null for a guest (collection shared from elsewhere) */
+  role: WorkspaceRole | null;
+  /** 1 view, 2 edit, 3 manage */
+  access_level: number;
 };
+
+/** The scene may be changed (saved, renamed, moved, trashed...) by this user */
+export const canEditScene = (scene: AccessibleScene) => scene.access_level >= ACCESS.edit;
 
 /**
  * The scene if the user may access it, else null. Trashed scenes are hidden unless
@@ -42,7 +60,8 @@ export async function findScene(
   const access = sceneAccessSql("$2");
   return run<AccessibleScene>(
     opts.client ?? null,
-    `SELECT s.id, s.owner_id, s.workspace_id, s.collection_id, s.version, s.deleted_at, wm.role
+    `SELECT s.id, s.owner_id, s.workspace_id, s.collection_id, s.version, s.deleted_at, wm.role,
+            ${access.level} as access_level
      FROM scenes s ${access.joins}
      WHERE s.id = $1 AND ${access.where}
        ${opts.includeDeleted ? "" : "AND s.deleted_at IS NULL"}
@@ -80,18 +99,30 @@ export type AccessibleCollection = {
   name: string;
   visibility: "private" | "workspace";
   is_personal: boolean;
-  role: WorkspaceRole;
+  /** null for a guest */
+  role: WorkspaceRole | null;
+  access_level: number;
 };
 
-/** A collection the user can see (and put scenes in), else null. */
-export async function findCollection(collectionId: string, userId: string): Promise<AccessibleCollection | null> {
+/**
+ * A collection the user can access, else null. By default one they can put
+ * scenes in (edit); pass `minLevel` for other checks.
+ */
+export async function findCollection(
+  collectionId: string,
+  userId: string,
+  minLevel: number = ACCESS.edit
+): Promise<AccessibleCollection | null> {
   return queryOne<AccessibleCollection>(
-    `SELECT c.id, c.workspace_id, c.owner_id, c.name, c.visibility, c.is_personal, wm.role
-     FROM collections c
-     JOIN workspaces w ON w.id = c.workspace_id AND w.deleted_at IS NULL
-     JOIN workspace_members wm ON wm.workspace_id = c.workspace_id AND wm.user_id = $2
-     WHERE c.id = $1 AND (c.visibility = 'workspace' OR c.owner_id = $2)`,
-    [collectionId, userId]
+    `SELECT * FROM (
+       SELECT c.id, c.workspace_id, c.owner_id, c.name, c.visibility, c.is_personal, wm.role,
+              collection_access_level(c.id, $2) as access_level
+       FROM collections c
+       JOIN workspaces w ON w.id = c.workspace_id AND w.deleted_at IS NULL
+       LEFT JOIN workspace_members wm ON wm.workspace_id = c.workspace_id AND wm.user_id = $2
+       WHERE c.id = $1
+     ) x WHERE access_level >= $3`,
+    [collectionId, userId, minLevel]
   );
 }
 

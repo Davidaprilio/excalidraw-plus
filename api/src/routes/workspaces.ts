@@ -2,14 +2,24 @@ import { Router, Response } from "express";
 import crypto from "crypto";
 import { query, queryOne, withTransaction } from "../db";
 import { authMiddleware, AuthRequest } from "../middleware/auth";
-import { requireUuidParam, serverError } from "../utils/http";
-import { createWorkspace, defaultWorkspaceName, getMembership, Membership, WorkspaceRole } from "../access";
+import { isUuid, requireUuidParam, serverError } from "../utils/http";
+import {
+  ACCESS,
+  COLLECTION_ROLES,
+  CollectionRole,
+  createWorkspace,
+  defaultWorkspaceName,
+  getMembership,
+  levelToRole,
+  Membership,
+  WorkspaceRole,
+} from "../access";
 import { avatarVersionSql, parseAvatarDataUrl } from "../utils/avatar";
 
 const router = Router();
 
 router.use(authMiddleware);
-for (const param of ["wid", "uid", "iid", "cid"]) {
+for (const param of ["wid", "uid", "iid", "cid", "tid"]) {
   router.param(param, requireUuidParam);
 }
 
@@ -487,20 +497,24 @@ router.delete("/:wid/invites/:iid", async (req: AuthRequest, res) => {
 
 // ---- Collections ----
 
-// Collections I can see: my own (incl. my Private one) and those shared with the workspace
+// Collections I can access (collection_access_level > 0), with my role in each
 router.get("/:wid/collections", async (req: AuthRequest, res) => {
   try {
     if (!(await requireRole(req, res, "any"))) return;
-    const collections = await query(
-      `SELECT c.id, c.name, c.visibility, c.is_personal, c.owner_id, u.name as owner_name, c.created_at, c.share_token, c.share_allow_save,
-              (SELECT COUNT(*)::int FROM scenes s
-               WHERE s.collection_id = c.id AND s.deleted_at IS NULL
-                 AND (s.owner_id = $2 OR c.visibility = 'workspace')) as scene_count
-       FROM collections c LEFT JOIN users u ON u.id = c.owner_id
-       WHERE c.workspace_id = $1 AND (c.visibility = 'workspace' OR c.owner_id = $2)
-       ORDER BY c.is_personal DESC, LOWER(c.name)`,
+    const rows = await query<any>(
+      `SELECT * FROM (
+         SELECT c.id, c.name, c.visibility, c.workspace_role, c.is_personal, c.owner_id, u.name as owner_name,
+                c.created_at, c.share_token, c.share_allow_save,
+                collection_access_level(c.id, $2) as access_level,
+                (SELECT COUNT(*)::int FROM scenes s WHERE s.collection_id = c.id AND s.deleted_at IS NULL) as scene_count
+         FROM collections c LEFT JOIN users u ON u.id = c.owner_id
+         WHERE c.workspace_id = $1
+       ) x
+       WHERE access_level > 0
+       ORDER BY is_personal DESC, LOWER(name)`,
       [req.params.wid, req.userId]
     );
+    const collections = rows.map(({ access_level, ...c }) => ({ ...c, my_role: levelToRole(access_level) }));
     res.json({ collections });
   } catch (err: any) {
     serverError(res, err);
@@ -518,25 +532,29 @@ router.post("/:wid/collections", async (req: AuthRequest, res) => {
     const collection = await queryOne(
       `INSERT INTO collections (workspace_id, owner_id, name, visibility)
        VALUES ($1, $2, $3, $4)
-       RETURNING id, name, visibility, is_personal, owner_id, created_at, share_token, share_allow_save`,
+       RETURNING id, name, visibility, workspace_role, is_personal, owner_id, created_at, share_token, share_allow_save`,
       [req.params.wid, req.userId, name.slice(0, 255), visibility]
     );
-    res.status(201).json({ collection: { ...collection, scene_count: 0 } });
+    res.status(201).json({ collection: { ...collection, scene_count: 0, my_role: "manage" } });
   } catch (err: any) {
     serverError(res, err);
   }
 });
 
-/** Collection the caller may manage: its owner or a workspace admin; never someone's Private. */
+/**
+ * Collection the caller may manage (manage level: its owner, managers, or a
+ * workspace admin when it's shared with the workspace); never someone's Private.
+ */
 async function findManageableCollection(req: AuthRequest, res: Response) {
-  const role = await requireRole(req, res, "any");
-  if (!role) return null;
-  const collection = await queryOne(
-    `SELECT id, owner_id, visibility, is_personal FROM collections
-     WHERE id = $1 AND workspace_id = $2 AND (visibility = 'workspace' OR owner_id = $3)`,
+  // guests (people/teams it's shared with) may manage it too: no membership needed
+  const role = (await getMembership(req.params.wid as string, req.userId!))?.role ?? null;
+  const collection = await queryOne<any>(
+    `SELECT id, workspace_id, owner_id, visibility, is_personal, share_token,
+            collection_access_level(id, $3) as access_level
+     FROM collections WHERE id = $1 AND workspace_id = $2`,
     [req.params.cid, req.params.wid, req.userId]
   );
-  if (!collection) {
+  if (!collection || collection.access_level < ACCESS.view) {
     res.status(404).json({ error: "Collection not found" });
     return null;
   }
@@ -544,28 +562,308 @@ async function findManageableCollection(req: AuthRequest, res: Response) {
     res.status(400).json({ error: "The Private collection can't be changed" });
     return null;
   }
-  if (collection.owner_id !== req.userId && role !== "admin") {
-    res.status(403).json({ error: "Only the collection owner or a workspace admin can do this" });
+  if (collection.access_level < ACCESS.manage) {
+    res.status(403).json({ error: "Only people who can manage this collection can do this" });
     return null;
   }
-  return collection;
+  return { ...collection, workspaceRole: role as WorkspaceRole | null };
 }
+
+const isWorkspaceMember = async (workspaceId: string, userId: string) =>
+  !!(await getMembership(workspaceId, userId));
+
+const isCollectionRole = (value: unknown): value is CollectionRole =>
+  COLLECTION_ROLES.includes(value as CollectionRole);
 
 router.patch("/:wid/collections/:cid", async (req: AuthRequest, res) => {
   try {
     if (!(await findManageableCollection(req, res))) return;
     const name = typeof req.body.name === "string" ? req.body.name.trim() : undefined;
-    const { visibility } = req.body;
-    if (name === "" || (visibility !== undefined && !["private", "workspace"].includes(visibility))) {
-      return res.status(400).json({ error: "Invalid name or visibility" });
+    const { visibility, workspaceRole } = req.body;
+    if (
+      name === "" ||
+      (visibility !== undefined && !["private", "workspace"].includes(visibility)) ||
+      (workspaceRole !== undefined && !isCollectionRole(workspaceRole))
+    ) {
+      return res.status(400).json({ error: "Invalid name, visibility or workspaceRole" });
+    }
+    if (visibility === "private") {
+      // a private collection stays within its workspace
+      await query("DELETE FROM collection_teams WHERE collection_id = $1", [req.params.cid]);
+      await query(
+        `DELETE FROM collection_members cm WHERE cm.collection_id = $1
+           AND NOT EXISTS (SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = $2 AND wm.user_id = cm.user_id)`,
+        [req.params.cid, req.params.wid]
+      );
     }
     const collection = await queryOne(
-      `UPDATE collections SET name = COALESCE($1, name), visibility = COALESCE($2, visibility), updated_at = NOW()
-       WHERE id = $3
-       RETURNING id, name, visibility, is_personal, owner_id, share_token, share_allow_save`,
-      [name?.slice(0, 255) ?? null, visibility ?? null, req.params.cid]
+      `UPDATE collections SET name = COALESCE($1, name), visibility = COALESCE($2, visibility),
+              workspace_role = COALESCE($3, workspace_role), updated_at = NOW(),
+              -- a private collection can't keep a public link
+              share_token = CASE WHEN COALESCE($2, visibility) = 'private' THEN NULL ELSE share_token END,
+              share_allow_save = CASE WHEN COALESCE($2, visibility) = 'private' THEN FALSE ELSE share_allow_save END
+       WHERE id = $4
+       RETURNING id, name, visibility, workspace_role, is_personal, owner_id, share_token, share_allow_save`,
+      [name?.slice(0, 255) ?? null, visibility ?? null, workspaceRole ?? null, req.params.cid]
     );
     res.json({ collection });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+// Who can access the collection: its owner, the workspace (when shared with it) and the people added
+router.get("/:wid/collections/:cid/access", async (req: AuthRequest, res) => {
+  try {
+    const collection = await queryOne<any>(
+      `SELECT c.id, c.visibility, c.workspace_role, c.is_personal, c.owner_id,
+              u.name as owner_name, u.email as owner_email,
+              (extract(epoch from u.avatar_updated_at) * 1000)::bigint as owner_avatar_version,
+              collection_access_level(c.id, $3) as access_level
+       FROM collections c LEFT JOIN users u ON u.id = c.owner_id
+       WHERE c.id = $1 AND c.workspace_id = $2`,
+      [req.params.cid, req.params.wid, req.userId]
+    );
+    if (!collection || collection.access_level < ACCESS.view) {
+      return res.status(404).json({ error: "Collection not found" });
+    }
+    const members = await query(
+      `SELECT u.id, u.name, u.email, cm.role, cm.created_at,
+              (extract(epoch from u.avatar_updated_at) * 1000)::bigint as avatar_version,
+              (wm.user_id IS NULL) as guest
+       FROM collection_members cm
+       JOIN users u ON u.id = cm.user_id
+       LEFT JOIN workspace_members wm ON wm.workspace_id = $2 AND wm.user_id = cm.user_id
+       WHERE cm.collection_id = $1
+       ORDER BY (wm.user_id IS NULL), CASE cm.role WHEN 'manage' THEN 0 WHEN 'edit' THEN 1 ELSE 2 END,
+                LOWER(COALESCE(u.name, u.email))`,
+      [req.params.cid, req.params.wid]
+    );
+    const teams = await query(
+      `SELECT w.id, w.name, ct.role, ${avatarVersionSql("w")},
+              (SELECT COUNT(*)::int FROM workspace_members m WHERE m.workspace_id = w.id) as member_count
+       FROM collection_teams ct JOIN workspaces w ON w.id = ct.workspace_id AND w.deleted_at IS NULL
+       WHERE ct.collection_id = $1
+       ORDER BY LOWER(w.name)`,
+      [req.params.cid]
+    );
+    const { access_level, owner_name, owner_email, owner_avatar_version, ...rest } = collection;
+    res.json({
+      access: {
+        ...rest,
+        my_role: levelToRole(access_level),
+        owner: collection.owner_id
+          ? { id: collection.owner_id, name: owner_name, email: owner_email, avatar_version: owner_avatar_version }
+          : null,
+        members,
+        teams,
+      },
+    });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+// Add someone from the workspace to the collection, or change their role: { role }
+router.put("/:wid/collections/:cid/members/:uid", async (req: AuthRequest, res) => {
+  try {
+    const collection = await findManageableCollection(req, res);
+    if (!collection) return;
+    if (!isCollectionRole(req.body.role)) {
+      return res.status(400).json({ error: "Role must be view, edit or manage" });
+    }
+    if (req.params.uid === collection.owner_id) {
+      return res.status(400).json({ error: "The owner always has full access" });
+    }
+    if (!(await queryOne("SELECT 1 FROM users WHERE id = $1", [req.params.uid]))) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    if (
+      collection.visibility === "private" &&
+      !(await isWorkspaceMember(req.params.wid as string, req.params.uid as string))
+    ) {
+      return res.status(400).json({ error: "A private collection can only be shared within its workspace" });
+    }
+    await query(
+      `INSERT INTO collection_members (collection_id, user_id, role, added_by) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (collection_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+      [req.params.cid, req.params.uid, req.body.role, req.userId]
+    );
+    res.json({ ok: true });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+// Remove someone (managers), or leave the collection yourself
+router.delete("/:wid/collections/:cid/members/:uid", async (req: AuthRequest, res) => {
+  try {
+    if (req.params.uid === req.userId) {
+      // leaving: anyone can remove themselves
+    } else if (!(await findManageableCollection(req, res))) {
+      return;
+    }
+    await query("DELETE FROM collection_members WHERE collection_id = $1 AND user_id = $2", [
+      req.params.cid,
+      req.params.uid,
+    ]);
+    res.json({ ok: true });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+// Share a public collection with another team (a workspace I belong to): { role }
+router.put("/:wid/collections/:cid/teams/:tid", async (req: AuthRequest, res) => {
+  try {
+    const collection = await findManageableCollection(req, res);
+    if (!collection) return;
+    if (!isCollectionRole(req.body.role)) {
+      return res.status(400).json({ error: "Role must be view, edit or manage" });
+    }
+    if (collection.visibility === "private") {
+      return res.status(400).json({ error: "A private collection can only be shared within its workspace" });
+    }
+    if (req.params.tid === req.params.wid) {
+      return res.status(400).json({ error: "Its own workspace gets access through its visibility" });
+    }
+    if (!(await isWorkspaceMember(req.params.tid as string, req.userId!))) {
+      return res.status(404).json({ error: "Team not found" });
+    }
+    await query(
+      `INSERT INTO collection_teams (collection_id, workspace_id, role, added_by) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (collection_id, workspace_id) DO UPDATE SET role = EXCLUDED.role`,
+      [req.params.cid, req.params.tid, req.body.role, req.userId]
+    );
+    res.json({ ok: true });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+router.delete("/:wid/collections/:cid/teams/:tid", async (req: AuthRequest, res) => {
+  try {
+    if (!(await findManageableCollection(req, res))) return;
+    await query("DELETE FROM collection_teams WHERE collection_id = $1 AND workspace_id = $2", [
+      req.params.cid,
+      req.params.tid,
+    ]);
+    res.json({ ok: true });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+// People to add to a collection, by name or email (2+ characters). Everyone registered for a
+// public collection (only exact emails when INVITE_USER_SUGGESTIONS=false), else its workspace.
+router.get("/:wid/collections/:cid/people", async (req: AuthRequest, res) => {
+  try {
+    const collection = await findManageableCollection(req, res);
+    if (!collection) return;
+    const q = typeof req.query.q === "string" ? req.query.q.trim().toLowerCase().slice(0, 100) : "";
+    if (q.length < 2) {
+      return res.json({ users: [] });
+    }
+    const like = `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+    const outsiders = collection.visibility === "workspace";
+    const users = await query(
+      `SELECT u.id, u.name, u.email, (extract(epoch from u.avatar_updated_at) * 1000)::bigint as avatar_version,
+              (wm.user_id IS NULL) as guest
+       FROM users u
+       LEFT JOIN workspace_members wm ON wm.workspace_id = $1 AND wm.user_id = u.id
+       WHERE u.id <> $3 AND u.id IS DISTINCT FROM $4
+         AND NOT EXISTS (SELECT 1 FROM collection_members cm WHERE cm.collection_id = $2 AND cm.user_id = u.id)
+         AND (
+           (wm.user_id IS NOT NULL AND (LOWER(u.email) LIKE $5 OR LOWER(COALESCE(u.name, '')) LIKE $5))
+           OR ($6 AND $7 AND (LOWER(u.email) LIKE $5 OR LOWER(COALESCE(u.name, '')) LIKE $5))
+           OR ($6 AND LOWER(u.email) = $8)
+         )
+       ORDER BY (wm.user_id IS NULL), LOWER(COALESCE(u.name, u.email))
+       LIMIT ${SUGGESTION_LIMIT}`,
+      [req.params.wid, req.params.cid, req.userId, collection.owner_id, like, outsiders, INVITE_SUGGESTIONS_ENABLED, q]
+    );
+    res.json({ users });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+// Make another workspace member the owner: { ownerId }. The previous owner keeps "manage".
+router.post("/:wid/collections/:cid/transfer-owner", async (req: AuthRequest, res) => {
+  try {
+    const collection = await findManageableCollection(req, res);
+    if (!collection) return;
+    if (collection.owner_id !== req.userId && collection.workspaceRole !== "admin") {
+      return res.status(403).json({ error: "Only the owner or a workspace admin can transfer ownership" });
+    }
+    const ownerId = req.body.ownerId;
+    if (!isUuid(ownerId) || ownerId === collection.owner_id) {
+      return res.status(400).json({ error: "Choose a new owner" });
+    }
+    if (!(await getMembership(req.params.wid as string, ownerId))) {
+      return res.status(400).json({ error: "The new owner must be a member of this workspace" });
+    }
+    await withTransaction(async (client) => {
+      await client.query("UPDATE collections SET owner_id = $1, updated_at = NOW() WHERE id = $2", [
+        ownerId,
+        req.params.cid,
+      ]);
+      await client.query("DELETE FROM collection_members WHERE collection_id = $1 AND user_id = $2", [
+        req.params.cid,
+        ownerId,
+      ]);
+      if (collection.owner_id) {
+        await client.query(
+          `INSERT INTO collection_members (collection_id, user_id, role, added_by) VALUES ($1, $2, 'manage', $3)
+           ON CONFLICT (collection_id, user_id) DO UPDATE SET role = 'manage'`,
+          [req.params.cid, collection.owner_id, req.userId]
+        );
+      }
+    });
+    res.json({ ok: true });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+// Move the collection, with its scenes, to another workspace I belong to: { workspaceId }.
+// People who aren't members there lose their access to it.
+router.post("/:wid/collections/:cid/move", async (req: AuthRequest, res) => {
+  try {
+    const collection = await findManageableCollection(req, res);
+    if (!collection) return;
+    if (collection.owner_id !== req.userId && collection.workspaceRole !== "admin") {
+      return res.status(403).json({ error: "Only the owner or a workspace admin can move this collection" });
+    }
+    const target = req.body.workspaceId;
+    if (!isUuid(target) || target === req.params.wid) {
+      return res.status(400).json({ error: "Choose another workspace" });
+    }
+    if (!(await getMembership(target, req.userId!))) {
+      return res.status(404).json({ error: "Workspace not found" });
+    }
+    await withTransaction(async (client) => {
+      // the owner must belong to the new workspace; otherwise the mover takes it over
+      const { rows: [ownerThere] } = await client.query(
+        "SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+        [target, collection.owner_id]
+      );
+      await client.query(
+        "UPDATE collections SET workspace_id = $1, owner_id = $2, updated_at = NOW() WHERE id = $3",
+        [target, ownerThere ? collection.owner_id : req.userId, req.params.cid]
+      );
+      await client.query("UPDATE scenes SET workspace_id = $1 WHERE collection_id = $2", [target, req.params.cid]);
+      await client.query("DELETE FROM collection_teams WHERE collection_id = $1 AND workspace_id = $2", [
+        req.params.cid,
+        target,
+      ]);
+      await client.query(
+        `DELETE FROM collection_members cm WHERE cm.collection_id = $1
+           AND NOT EXISTS (SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = $2 AND wm.user_id = cm.user_id)`,
+        [req.params.cid, target]
+      );
+    });
+    res.json({ ok: true, workspaceId: target });
   } catch (err: any) {
     serverError(res, err);
   }
@@ -575,7 +873,11 @@ router.patch("/:wid/collections/:cid", async (req: AuthRequest, res) => {
 // stopping drops it, so sharing again gives a new link.
 router.post("/:wid/collections/:cid/share", async (req: AuthRequest, res) => {
   try {
-    if (!(await findManageableCollection(req, res))) return;
+    const found = await findManageableCollection(req, res);
+    if (!found) return;
+    if (found.visibility === "private") {
+      return res.status(409).json({ error: "A private collection can't be shared by link" });
+    }
     const collection = await queryOne(
       `UPDATE collections SET share_token = COALESCE(share_token, $1), updated_at = NOW()
        WHERE id = $2
