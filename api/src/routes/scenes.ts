@@ -167,6 +167,55 @@ router.get("/:id", authMiddleware, async (req: AuthRequest, res) => {
   }
 });
 
+/**
+ * Who can open the scene: its owner, plus every workspace member when it sits in
+ * a collection shared with the workspace (see sceneAccessSql). Read only: access
+ * is managed from the dashboard (members, collections, share link).
+ */
+router.get("/:id/access", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const scene = await findScene(req.params.id as string, req.userId!);
+    if (!scene) {
+      return res.status(404).json({ error: "Scene not found" });
+    }
+    const info = await queryOne<any>(
+      `SELECT s.is_shared, w.id as workspace_id, w.name as workspace_name,
+              c.id as collection_id, c.name as collection_name, c.visibility as collection_visibility
+       FROM scenes s
+       JOIN workspaces w ON w.id = s.workspace_id
+       LEFT JOIN collections c ON c.id = s.collection_id
+       WHERE s.id = $1`,
+      [scene.id]
+    );
+    const users = await query(
+      `SELECT u.id, u.name, u.email,
+              (extract(epoch from u.avatar_updated_at) * 1000)::bigint as avatar_version,
+              CASE WHEN u.id = s.owner_id THEN 'owner'
+                   WHEN wm.role = 'admin' THEN 'admin'
+                   ELSE 'editor' END as access
+       FROM scenes s
+       JOIN workspace_members wm ON wm.workspace_id = s.workspace_id
+       JOIN users u ON u.id = wm.user_id
+       LEFT JOIN collections c ON c.id = s.collection_id
+       WHERE s.id = $1 AND (wm.user_id = s.owner_id OR c.visibility = 'workspace')
+       ORDER BY (u.id = s.owner_id) DESC, (wm.role = 'admin') DESC, lower(coalesce(u.name, u.email))`,
+      [scene.id]
+    );
+    res.json({
+      access: {
+        workspace: { id: info.workspace_id, name: info.workspace_name },
+        collection: info.collection_id
+          ? { id: info.collection_id, name: info.collection_name, visibility: info.collection_visibility }
+          : null,
+        is_shared: info.is_shared,
+        users,
+      },
+    });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
 // Pin / unpin the scene for the current user
 router.post("/:id/pin", authMiddleware, async (req: AuthRequest, res) => {
   try {
