@@ -9,6 +9,8 @@ services:
       DATABASE_URL: ${DATABASE_URL_DOCKER:?Set DATABASE_URL_DOCKER in .env}
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       UPLOAD_DIR: /uploads
+      # public URL of the app (passkeys only work on this origin)
+      APP_ORIGIN: ${APP_ORIGIN_DOCKER:-http://localhost}
       PORT: 4001
     volumes:
       - uploads:/uploads

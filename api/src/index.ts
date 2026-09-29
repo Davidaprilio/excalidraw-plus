@@ -10,6 +10,8 @@ import teamRoutes from "./routes/teams";
 import collabRoutes from "./routes/collab";
 import workspaceRoutes from "./routes/workspaces";
 import inviteRoutes from "./routes/invites";
+import userRoutes from "./routes/users";
+import securityRoutes from "./routes/security";
 
 const app = express();
 const PORT = parseInt(process.env.PORT || "4001");
@@ -24,6 +26,7 @@ app.get("/api/health", (_req, res) => {
 
 // Routes
 app.use("/api/auth", authRoutes);
+app.use("/api/auth", securityRoutes);
 app.use("/api/scenes", sceneRoutes);
 app.use("/api/files", fileRoutes);
 app.use("/api/libraries", libraryRoutes);
@@ -31,6 +34,7 @@ app.use("/api/teams", teamRoutes);
 app.use("/api/collab", collabRoutes);
 app.use("/api/workspaces", workspaceRoutes);
 app.use("/api/invites", inviteRoutes);
+app.use("/api/users", userRoutes);
 
 runMigrations()
   .then(() => {

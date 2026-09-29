@@ -31,6 +31,26 @@ export function verifyRefreshToken(token: string): { userId: string } | null {
   }
 }
 
+/**
+ * Short-lived signed token for a multi-step auth flow ("mfa" after the password,
+ * "webauthn-register" / "webauthn-login" carrying the challenge).
+ */
+export function signPurposeToken(purpose: string, payload: Record<string, unknown>, ttl = "5m"): string {
+  return jwt.sign({ ...payload, type: purpose }, JWT_SECRET, { expiresIn: ttl } as jwt.SignOptions);
+}
+
+export function verifyPurposeToken<T = Record<string, unknown>>(token: unknown, purpose: string): T | null {
+  if (typeof token !== "string") {
+    return null;
+  }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as any;
+    return payload.type === purpose ? (payload as T) : null;
+  } catch {
+    return null;
+  }
+}
+
 export function authMiddleware(req: AuthRequest, res: Response, next: NextFunction) {
   const header = req.headers.authorization;
   if (!header?.startsWith("Bearer ")) {

@@ -4,12 +4,14 @@ import { query, queryOne, withTransaction } from "../db";
 import { createWorkspace, defaultWorkspaceName } from "../access";
 import {
   signAccessToken,
-  signRefreshToken,
+  signPurposeToken,
   verifyRefreshToken,
   authMiddleware,
   AuthRequest,
 } from "../middleware/auth";
 import { serverError } from "../utils/http";
+import { issueSession } from "../utils/session";
+import crypto from "crypto";
 
 const router = Router();
 
@@ -29,22 +31,14 @@ router.post("/register", async (req, res) => {
     // Every account starts with its own workspace (and Private collection)
     const user = await withTransaction(async (client) => {
       const { rows: [created] } = await client.query(
-        "INSERT INTO users (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id, email, name, created_at",
+        "INSERT INTO users (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id, email, name, created_at, NULL::bigint as avatar_version",
         [email, passwordHash, name || email.split("@")[0]]
       );
       await createWorkspace(client, created.id, defaultWorkspaceName(created), { personal: true });
       return created;
     });
 
-    const accessToken = signAccessToken(user!.id);
-    const refreshToken = signRefreshToken(user!.id);
-
-    await query(
-      "INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES ($1, $2, NOW() + INTERVAL '30 days')",
-      [user!.id, refreshToken]
-    );
-
-    res.status(201).json({ accessToken, refreshToken, user });
+    res.status(201).json(await issueSession(user.id));
   } catch (err: any) {
     serverError(res, err);
   }
@@ -58,7 +52,7 @@ router.post("/login", async (req, res) => {
     }
 
     const user = await queryOne(
-      "SELECT id, email, name, password_hash FROM users WHERE email = $1",
+      "SELECT id, password_hash, (totp_secret IS NOT NULL) as totp_enabled FROM users WHERE email = $1",
       [email]
     );
     if (!user) {
@@ -70,19 +64,15 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    const accessToken = signAccessToken(user.id);
-    const refreshToken = signRefreshToken(user.id);
+    // Two-factor: no tokens yet, the client completes with POST /auth/login/mfa
+    if (user.totp_enabled) {
+      return res.json({
+        mfaRequired: true,
+        mfaToken: signPurposeToken("mfa", { userId: user.id, nonce: crypto.randomUUID() }),
+      });
+    }
 
-    await query(
-      "INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES ($1, $2, NOW() + INTERVAL '30 days')",
-      [user.id, refreshToken]
-    );
-
-    res.json({
-      accessToken,
-      refreshToken,
-      user: { id: user.id, email: user.email, name: user.name },
-    });
+    res.json(await issueSession(user.id));
   } catch (err: any) {
     serverError(res, err);
   }
@@ -130,13 +120,102 @@ router.post("/logout", authMiddleware, async (req: AuthRequest, res) => {
 router.get("/me", authMiddleware, async (req: AuthRequest, res) => {
   try {
     const user = await queryOne(
-      "SELECT id, email, name, created_at FROM users WHERE id = $1",
+      "SELECT id, email, name, created_at, (extract(epoch from avatar_updated_at) * 1000)::bigint as avatar_version FROM users WHERE id = $1",
       [req.userId]
     );
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
     res.json({ user });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+// Update profile (display name)
+router.patch("/me", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const name = typeof req.body.name === "string" ? req.body.name.trim() : "";
+    if (!name) {
+      return res.status(400).json({ error: "Name is required" });
+    }
+    const user = await queryOne(
+      "UPDATE users SET name = $1, updated_at = NOW() WHERE id = $2 RETURNING id, email, name, created_at, (extract(epoch from avatar_updated_at) * 1000)::bigint as avatar_version",
+      [name.slice(0, 255), req.userId]
+    );
+    res.json({ user });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+const AVATAR_DATA_URL_RE = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/;
+const MAX_AVATAR_BYTES = 256 * 1024;
+
+// Upload profile photo (a data URL, already resized by the client)
+router.put("/me/avatar", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const match = typeof req.body.image === "string" && AVATAR_DATA_URL_RE.exec(req.body.image);
+    if (!match) {
+      return res.status(400).json({ error: "image must be a png/jpeg/webp data URL" });
+    }
+    const data = Buffer.from(match[2], "base64");
+    if (data.length > MAX_AVATAR_BYTES) {
+      return res.status(413).json({ error: "Photo too large" });
+    }
+    const user = await queryOne(
+      `UPDATE users SET avatar = $1, avatar_mime = $2, avatar_updated_at = NOW(), updated_at = NOW()
+       WHERE id = $3
+       RETURNING id, email, name, created_at, ${"(extract(epoch from avatar_updated_at) * 1000)::bigint as avatar_version"}`,
+      [data, match[1], req.userId]
+    );
+    res.json({ user });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+router.delete("/me/avatar", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const user = await queryOne(
+      `UPDATE users SET avatar = NULL, avatar_mime = NULL, avatar_updated_at = NULL, updated_at = NOW()
+       WHERE id = $1
+       RETURNING id, email, name, created_at, NULL::bigint as avatar_version`,
+      [req.userId]
+    );
+    res.json({ user });
+  } catch (err: any) {
+    serverError(res, err);
+  }
+});
+
+const MIN_PASSWORD_LENGTH = 8;
+
+/**
+ * Change password. Other devices are signed out (their refresh tokens are
+ * revoked); pass `refreshToken` to keep the current device's session.
+ */
+router.post("/change-password", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { currentPassword, newPassword, refreshToken } = req.body;
+    if (typeof newPassword !== "string" || newPassword.length < MIN_PASSWORD_LENGTH) {
+      return res.status(400).json({ error: `The new password needs at least ${MIN_PASSWORD_LENGTH} characters` });
+    }
+    const user = await queryOne("SELECT password_hash FROM users WHERE id = $1", [req.userId]);
+    if (!user || typeof currentPassword !== "string" || !(await bcrypt.compare(currentPassword, user.password_hash))) {
+      return res.status(400).json({ error: "The current password is incorrect" });
+    }
+    await withTransaction(async (client) => {
+      await client.query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2", [
+        await bcrypt.hash(newPassword, 10),
+        req.userId,
+      ]);
+      await client.query("DELETE FROM refresh_tokens WHERE user_id = $1 AND token IS DISTINCT FROM $2", [
+        req.userId,
+        typeof refreshToken === "string" ? refreshToken : null,
+      ]);
+    });
+    res.json({ ok: true });
   } catch (err: any) {
     serverError(res, err);
   }

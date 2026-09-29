@@ -294,7 +294,8 @@ router.get("/:wid/members", async (req: AuthRequest, res) => {
   try {
     if (!(await requireRole(req, res, "any"))) return;
     const members = await query(
-      `SELECT u.id, u.email, u.name, wm.role, wm.joined_at, (w.owner_id = u.id) as is_owner
+      `SELECT u.id, u.email, u.name, wm.role, wm.joined_at, (w.owner_id = u.id) as is_owner,
+              (extract(epoch from u.avatar_updated_at) * 1000)::bigint as avatar_version
        FROM workspace_members wm
        JOIN users u ON u.id = wm.user_id
        JOIN workspaces w ON w.id = wm.workspace_id
